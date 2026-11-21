@@ -4,7 +4,7 @@ import mechfight as mf
 
 
 class Bot:
-    name = "example-py"
+    name = "movementv2-py"
 
     def __init__(self, hello: mf.Hello):
         self.reach = hello["config"]["loot"]["pickup_radius"]
@@ -20,8 +20,41 @@ class Bot:
         if me["weapons"][1] is None and near and near[0]["kind"] != "gun":
             act["take"] = near[0]["id"]
         enemies = sorted((m for m in obs["mechs"] if m["kind"] == "mech"), key=lambda m: math.dist(m["pos"], me["pos"]))
+        # Default: move toward the next safe-zone center.
+        move_x = goal[0] - x
+        move_y = goal[1] - y
+
+        # When safely inside the zone, try to maintain distance
+        # from nearby enemies without changing combat behavior.
+        if me["in_zone"] and enemies:
+            closest = enemies[0]
+            ex, ey = closest["pos"][:2]
+
+            dx = x - ex
+            dy = y - ey
+            distance = math.hypot(dx, dy)
+
+            if 0.001 < distance < 45:
+                move_x += (dx / distance) * 35
+                move_y += (dy / distance) * 35
+
+        length = math.hypot(move_x, move_y)
+
+        if length > 0.001:
+            move_x /= length
+            move_y /= length
+        else:
+            move_x = 0.0
+            move_y = 0.0
+
         yaw = math.atan2(goal[1] - y, goal[0] - x)
-        act.update(move=[math.cos(yaw), math.sin(yaw)], aim=[yaw, 0.0], boost=not me["in_zone"], jump=obs["tick"] % 40 == 0)
+
+        act.update(
+            move=[move_x, move_y],
+            aim=[yaw, 0.0],
+            boost=not me["in_zone"],
+            jump=obs["tick"] % 40 == 0
+        )
         if enemies:
             t = enemies[0]["pos"]
             aim = [math.atan2(t[1] - y, t[0] - x), math.atan2(t[2] - z - 2.5, math.dist(t[:2], (x, y)))]
