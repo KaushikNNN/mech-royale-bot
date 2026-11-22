@@ -1,5 +1,5 @@
 
-"""Mech Royale V12: V11 plus map-aware short-horizon obstacle steering."""
+"""Mech Royale V13: V12 with adaptive upgrades, zone recovery and tactical targeting."""
 
 import math
 import json
@@ -8,7 +8,7 @@ import mechfight as mf
 
 
 class Bot:
-    name = "map-steer-v12"
+    name = "adaptive-v13"
 
     def __init__(self, hello: mf.Hello):
         config = hello["config"]
@@ -427,6 +427,37 @@ class Bot:
         candidates.sort(key=lambda item: item[0])
         return candidates[0][1], candidates[0][2]
 
+    def select_upgrade(self, offer, me):
+        """Prioritize durable survival upgrades over arbitrary first choices."""
+        priorities = {
+            "armor": 100, "regen": 96, "health": 94, "hp": 94,
+            "walk": 86, "boost": 84, "speed": 82, "energy": 75,
+            "gun_damage": 72, "gun_rate": 70, "gun_mag": 50,
+            "laser_damage": 68, "lightning_damage": 67,
+            "sensors": 18, "vision": 16,
+        }
+        best_i, best_score = 0, -1e9
+        for i, choice in enumerate(offer.get("choices", [])):
+            ident = str(choice.get("id", "")).lower()
+            score = priorities.get(ident, 35)
+            for key, value in priorities.items():
+                if key in ident:
+                    score = max(score, value)
+            if me["hp"] < 0.5 * me["max_hp"] and any(k in ident for k in ("armor", "regen", "health", "hp")):
+                score += 10
+            if score > best_score:
+                best_score, best_i = score, i
+        return best_i
+
+    def select_target(self, me, enemies):
+        """Prefer nearby weak targets, but avoid switching to distant ones."""
+        if not enemies:
+            return None
+        x, y = me["pos"][:2]
+        return min(enemies, key=lambda e:
+                   math.hypot(e["pos"][0] - x, e["pos"][1] - y)
+                   + 15.0 * e.get("hp", 1400) / max(1.0, e.get("max_hp", 1400)))
+
     def act(self, obs: mf.Observation) -> mf.Action:
         me = obs["self"]
         x, y, z = me["pos"]
@@ -438,7 +469,7 @@ class Bot:
 
         # V8 upgrades.
         if obs["offer"]:
-            act["pick"] = 0
+            act["pick"] = self.select_upgrade(obs["offer"], me)
 
         enemies = sorted(
             (
@@ -522,7 +553,7 @@ class Bot:
 
         # Preserve V8 combat.
         if enemies:
-            target = enemies[0]
+            target = self.select_target(me, enemies)
             ex, ey, ez = target["pos"]
 
             aim_x, aim_y, aim_z = (
@@ -563,10 +594,19 @@ class Bot:
             fire_secondary = self.secondary_fire(
                 me, enemies
             )
+            target_distance = self.distance((x, y), target["pos"])
+            # Preserve passive regeneration when far from combat and injured.
+            # Gun shots at extreme range are unlikely to be useful.
+            gun = me["weapons"][0]
+            gun_range = gun["stats"].get("range", 230.0) if gun else 230.0
+            fire_gun = target_distance < min(gun_range - 8.0, 205.0)
+            if me["hp"] < me["max_hp"] * 0.65 and target_distance > 125.0:
+                fire_gun = False
+                fire_secondary = False
 
             act.update(
                 aim=[aim_yaw, aim_pitch],
-                fire=[True, fire_secondary]
+                fire=[fire_gun, fire_secondary]
             )
 
             mf.draw.line(
@@ -582,7 +622,7 @@ class Bot:
         )
 
         mf.draw.label(
-            f"V12 | HP {me['hp']:.0f} | "
+            f"V13 | HP {me['hp']:.0f} | "
             f"Cubes {me['cubes']} | {goal_type}"
         )
 
