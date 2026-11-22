@@ -1,5 +1,5 @@
 
-"""Mech Royale V13: V12 with adaptive upgrades, zone recovery and tactical targeting."""
+"""Mech Royale V14: V12 plus predictive enemy movement avoidance."""
 
 import math
 import json
@@ -8,7 +8,7 @@ import mechfight as mf
 
 
 class Bot:
-    name = "adaptive-v13"
+    name = "predictive-avoid-v14"
 
     def __init__(self, hello: mf.Hello):
         config = hello["config"]
@@ -120,8 +120,19 @@ class Bot:
             nx, ny = x + dx * 17, y + dy * 17
             if math.hypot(nx - zone["center"][0], ny - zone["center"][1]) > zone["radius"] - 5:
                 continue
-            danger = sum(max(0, 70 - math.hypot(nx - e["pos"][0], ny - e["pos"][1])) / 70
-                         for e in enemies)
+            danger = 0.0
+            for e in enemies:
+                ex, ey = e["pos"][:2]
+                evx, evy = e.get("vel", (0.0, 0.0))[:2]
+                # Look ahead 1.2 seconds, with a cap to avoid unreliable extrapolation.
+                evx = max(-20.0, min(20.0, evx))
+                evy = max(-20.0, min(20.0, evy))
+                future_x, future_y = ex + evx * 1.2, ey + evy * 1.2
+                current_d = math.hypot(nx - ex, ny - ey)
+                future_d = math.hypot(nx - future_x, ny - future_y)
+                # Penalize both current and predicted proximity.
+                danger += (0.35 * max(0.0, 70.0 - current_d)
+                           + 0.65 * max(0.0, 70.0 - future_d)) / 70.0
             score = 2.5 * (dx * desired[0] + dy * desired[1]) - 0.55 * danger
             score -= 0.25 * abs(offset)
             if score > best_score:
@@ -144,15 +155,24 @@ class Bot:
         threat_count = 0
         for enemy in enemies:
             ex, ey = enemy["pos"][:2]
-            vx, vy = x - ex, y - ey
-            distance = math.hypot(vx, vy)
+            evx, evy = enemy.get("vel", (0.0, 0.0))[:2]
+            evx = max(-20.0, min(20.0, evx))
+            evy = max(-20.0, min(20.0, evy))
+            # Avoid the enemy's predicted position as well as its current one.
+            future_x, future_y = ex + 1.2 * evx, ey + 1.2 * evy
+            current_dist = math.hypot(x - ex, y - ey)
+            future_dist = math.hypot(x - future_x, y - future_y)
+            distance = 0.4 * current_dist + 0.6 * future_dist
             if distance >= 85.0:
                 continue
             threat_count += 1
             strength = min(2.4, (85.0 - distance) / 45.0)
-            if distance > 0.001:
-                dx += strength * vx / distance
-                dy += strength * vy / distance
+            vx = x - (0.4 * ex + 0.6 * future_x)
+            vy = y - (0.4 * ey + 0.6 * future_y)
+            direction_length = math.hypot(vx, vy)
+            if direction_length > 0.001:
+                dx += strength * vx / direction_length
+                dy += strength * vy / direction_length
 
         # Don't retreat out of the playable zone. When outside, head inward.
         zx, zy = zone["center"][:2]
@@ -427,37 +447,6 @@ class Bot:
         candidates.sort(key=lambda item: item[0])
         return candidates[0][1], candidates[0][2]
 
-    def select_upgrade(self, offer, me):
-        """Prioritize durable survival upgrades over arbitrary first choices."""
-        priorities = {
-            "armor": 100, "regen": 96, "health": 94, "hp": 94,
-            "walk": 86, "boost": 84, "speed": 82, "energy": 75,
-            "gun_damage": 72, "gun_rate": 70, "gun_mag": 50,
-            "laser_damage": 68, "lightning_damage": 67,
-            "sensors": 18, "vision": 16,
-        }
-        best_i, best_score = 0, -1e9
-        for i, choice in enumerate(offer.get("choices", [])):
-            ident = str(choice.get("id", "")).lower()
-            score = priorities.get(ident, 35)
-            for key, value in priorities.items():
-                if key in ident:
-                    score = max(score, value)
-            if me["hp"] < 0.5 * me["max_hp"] and any(k in ident for k in ("armor", "regen", "health", "hp")):
-                score += 10
-            if score > best_score:
-                best_score, best_i = score, i
-        return best_i
-
-    def select_target(self, me, enemies):
-        """Prefer nearby weak targets, but avoid switching to distant ones."""
-        if not enemies:
-            return None
-        x, y = me["pos"][:2]
-        return min(enemies, key=lambda e:
-                   math.hypot(e["pos"][0] - x, e["pos"][1] - y)
-                   + 15.0 * e.get("hp", 1400) / max(1.0, e.get("max_hp", 1400)))
-
     def act(self, obs: mf.Observation) -> mf.Action:
         me = obs["self"]
         x, y, z = me["pos"]
@@ -469,7 +458,7 @@ class Bot:
 
         # V8 upgrades.
         if obs["offer"]:
-            act["pick"] = self.select_upgrade(obs["offer"], me)
+            act["pick"] = 0
 
         enemies = sorted(
             (
@@ -553,7 +542,7 @@ class Bot:
 
         # Preserve V8 combat.
         if enemies:
-            target = self.select_target(me, enemies)
+            target = enemies[0]
             ex, ey, ez = target["pos"]
 
             aim_x, aim_y, aim_z = (
@@ -594,19 +583,10 @@ class Bot:
             fire_secondary = self.secondary_fire(
                 me, enemies
             )
-            target_distance = self.distance((x, y), target["pos"])
-            # Preserve passive regeneration when far from combat and injured.
-            # Gun shots at extreme range are unlikely to be useful.
-            gun = me["weapons"][0]
-            gun_range = gun["stats"].get("range", 230.0) if gun else 230.0
-            fire_gun = target_distance < min(gun_range - 8.0, 205.0)
-            if me["hp"] < me["max_hp"] * 0.65 and target_distance > 125.0:
-                fire_gun = False
-                fire_secondary = False
 
             act.update(
                 aim=[aim_yaw, aim_pitch],
-                fire=[fire_gun, fire_secondary]
+                fire=[True, fire_secondary]
             )
 
             mf.draw.line(
@@ -622,7 +602,7 @@ class Bot:
         )
 
         mf.draw.label(
-            f"V13 | HP {me['hp']:.0f} | "
+            f"V14 | HP {me['hp']:.0f} | "
             f"Cubes {me['cubes']} | {goal_type}"
         )
 
