@@ -1,44 +1,70 @@
 
-"""Mech Royale V5: smarter loot and upgrade choices."""
+"""Mech Royale V6: V4 looting with predictive gun aiming."""
 
 import math
 import mechfight as mf
 
 
 class Bot:
-    name = "smart-loot-v5"
+    name = "predictive-v6"
 
     def __init__(self, hello: mf.Hello):
         self.reach = hello["config"]["loot"]["pickup_radius"]
+        self.gun_speed = hello["config"]["weapons"]["gun"].get(
+            "speed", 252.0
+        )
 
-    def choose_upgrade(self, offer):
-        choices = offer["choices"]
+    def predict_target(self, me, enemy, speed):
+        """Calculate a constant-velocity intercept point."""
 
-        def score(choice):
-            text = (
-                choice["id"] + " " +
-                choice["name"] + " " +
-                choice["desc"]
-            ).lower()
+        x, y, z = me["pos"]
+        ex, ey, ez = enemy["pos"]
+        vx, vy, vz = enemy["vel"]
 
-            priorities = [
-                (("regenerat", "repair", "healing"), 100),
-                (("armor", "shield", "resist"), 95),
-                (("max hp", "health", "hit point"), 90),
-                (("speed", "mobility", "sprint"), 85),
-                (("energy", "boost"), 80),
-                (("damage", "fire rate", "cooldown"), 65),
-                (("range", "accuracy"), 55),
-            ]
+        # Gun muzzle and approximate enemy center.
+        sx, sy, sz = x, y, z + 7.0
+        tx, ty, tz = ex, ey, ez + 4.5
 
-            best = 30
-            for keywords, value in priorities:
-                if any(word in text for word in keywords):
-                    best = max(best, value)
+        rx = tx - sx
+        ry = ty - sy
+        rz = tz - sz
 
-            return best
+        a = vx * vx + vy * vy + vz * vz - speed * speed
+        b = 2.0 * (rx * vx + ry * vy + rz * vz)
+        c = rx * rx + ry * ry + rz * rz
 
-        return max(range(len(choices)), key=lambda i: score(choices[i]))
+        intercept_time = None
+
+        if abs(a) < 0.000001:
+            if abs(b) > 0.000001:
+                t = -c / b
+                if t > 0:
+                    intercept_time = t
+        else:
+            discriminant = b * b - 4.0 * a * c
+
+            if discriminant >= 0:
+                root = math.sqrt(discriminant)
+
+                t1 = (-b - root) / (2.0 * a)
+                t2 = (-b + root) / (2.0 * a)
+
+                valid = [t for t in (t1, t2) if t > 0]
+
+                if valid:
+                    intercept_time = min(valid)
+
+        if intercept_time is None:
+            return [tx, ty, tz]
+
+        # Limit extrapolation to avoid extreme predictions.
+        intercept_time = min(intercept_time, 1.0)
+
+        return [
+            tx + vx * intercept_time,
+            ty + vy * intercept_time,
+            tz + vz * intercept_time
+        ]
 
     def act(self, obs: mf.Observation) -> mf.Action:
         me = obs["self"]
@@ -47,70 +73,59 @@ class Bot:
 
         act: mf.Action = {"tick": obs["tick"]}
 
-        # Improved upgrade selection.
-        if obs["offer"] and obs["offer"]["choices"]:
-            act["pick"] = self.choose_upgrade(obs["offer"])
+        # Original upgrade behavior.
+        if obs["offer"]:
+            act["pick"] = 0
 
+        # Original enemy detection.
         enemies = sorted(
             (m for m in obs["mechs"] if m["kind"] == "mech"),
             key=lambda m: math.dist(m["pos"], me["pos"])
         )
 
-        enemy_distance = (
-            math.dist(enemies[0]["pos"][:2], (x, y))
-            if enemies else float("inf")
-        )
+        # V4 weapon pickup logic.
+        near = [
+            p for p in obs["pickups"]
+            if math.dist(p["pos"][:2], (x, y)) < self.reach
+        ]
 
-        # Equipment priorities are experimental.
-        weapon_priority = {
-            "laser": 0,
-            "lightning": 1,
-            "mortar": 2,
-        }
+        if (
+            me["weapons"][1] is None
+            and near
+            and near[0]["kind"] != "gun"
+        ):
+            act["take"] = near[0]["id"]
 
-        # Keep seeking equipment until slot 1 is filled.
-        if me["weapons"][1] is None:
+        # V4 weapon acquisition.
+        if me["weapons"][1] is None and me["in_zone"]:
             available = [
                 p for p in obs["pickups"]
                 if p["kind"] != "gun"
             ]
 
-            # Prefer nearby equipment, with a small
-            # adjustment for weapon type.
-            available.sort(
-                key=lambda p: (
-                    math.dist(p["pos"][:2], (x, y))
-                    + weapon_priority.get(p["kind"], 3) * 4
+            if available:
+                closest = min(
+                    available,
+                    key=lambda p: math.dist(
+                        p["pos"][:2], (x, y)
+                    )
                 )
-            )
 
-            # Take any eligible nearby weapon.
-            in_reach = [
-                p for p in available
-                if math.dist(p["pos"][:2], (x, y)) < self.reach
-            ]
-
-            if in_reach:
-                act["take"] = in_reach[0]["id"]
-
-            # V4-inspired weapon detours.
-            if me["in_zone"] and available:
-                closest = available[0]
                 loot_distance = math.dist(
                     closest["pos"][:2], (x, y)
                 )
 
-                if enemy_distance > 75:
-                    max_detour = 50
-                elif enemy_distance > 60:
-                    max_detour = 35
-                else:
-                    max_detour = 0
+                enemy_close = (
+                    enemies
+                    and math.dist(
+                        enemies[0]["pos"][:2], (x, y)
+                    ) < 60
+                )
 
-                if loot_distance < max_detour:
+                if loot_distance < 35 and not enemy_close:
                     goal = closest["pos"]
 
-        # Preserve original movement.
+        # Original movement.
         yaw = math.atan2(goal[1] - y, goal[0] - x)
 
         act.update(
@@ -120,26 +135,58 @@ class Bot:
             jump=obs["tick"] % 40 == 0
         )
 
-        # Preserve original combat.
+        # Improved combat aiming.
         if enemies:
-            t = enemies[0]["pos"]
+            target = enemies[0]
+            ex, ey, ez = target["pos"]
 
-            aim = [
-                math.atan2(t[1] - y, t[0] - x),
-                math.atan2(
-                    t[2] - z - 2.5,
-                    math.dist(t[:2], (x, y))
+            distance = math.dist(
+                target["pos"][:2], (x, y)
+            )
+
+            # Original direct aim.
+            aim_x, aim_y, aim_z = ex, ey, ez + 4.5
+
+            secondary = me["weapons"][1]
+
+            # Prioritize the secondary weapon's direct
+            # aim when it has different firing mechanics.
+            use_prediction = (
+                secondary is None
+                or secondary["kind"] == "laser"
+            )
+
+            if use_prediction:
+                gun = me["weapons"][0]
+
+                speed = self.gun_speed
+
+                if gun is not None and gun["kind"] == "gun":
+                    speed = gun["stats"].get(
+                        "speed", self.gun_speed
+                    )
+
+                aim_x, aim_y, aim_z = self.predict_target(
+                    me, target, speed
                 )
-            ]
+
+            aim_yaw = math.atan2(
+                aim_y - y, aim_x - x
+            )
+
+            aim_pitch = math.atan2(
+                aim_z - (z + 7.0),
+                math.hypot(aim_x - x, aim_y - y)
+            )
 
             act.update(
-                aim=aim,
+                aim=[aim_yaw, aim_pitch],
                 fire=[True, True]
             )
 
             mf.draw.line(
                 [x, y, z + 7],
-                [t[0], t[1], t[2] + 4.5],
+                [aim_x, aim_y, aim_z],
                 "#ff5040"
             )
 
@@ -150,8 +197,8 @@ class Bot:
         )
 
         mf.draw.label(
-            f"V5 | HP {me['hp']:.0f} | "
-            f"Enemies {len(enemies)}"
+            f"V6 | hp {me['hp']:.0f} | "
+            f"{len(enemies)} enemies"
         )
 
         return act
