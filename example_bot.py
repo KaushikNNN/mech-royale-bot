@@ -1,5 +1,5 @@
 
-"""Mech Royale V14: V12 plus predictive enemy movement avoidance."""
+"""Mech Royale V15: V12 plus placement-focused zone positioning."""
 
 import math
 import json
@@ -8,7 +8,7 @@ import mechfight as mf
 
 
 class Bot:
-    name = "predictive-avoid-v14"
+    name = "zone-survival-v15"
 
     def __init__(self, hello: mf.Hello):
         config = hello["config"]
@@ -120,24 +120,55 @@ class Bot:
             nx, ny = x + dx * 17, y + dy * 17
             if math.hypot(nx - zone["center"][0], ny - zone["center"][1]) > zone["radius"] - 5:
                 continue
-            danger = 0.0
-            for e in enemies:
-                ex, ey = e["pos"][:2]
-                evx, evy = e.get("vel", (0.0, 0.0))[:2]
-                # Look ahead 1.2 seconds, with a cap to avoid unreliable extrapolation.
-                evx = max(-20.0, min(20.0, evx))
-                evy = max(-20.0, min(20.0, evy))
-                future_x, future_y = ex + evx * 1.2, ey + evy * 1.2
-                current_d = math.hypot(nx - ex, ny - ey)
-                future_d = math.hypot(nx - future_x, ny - future_y)
-                # Penalize both current and predicted proximity.
-                danger += (0.35 * max(0.0, 70.0 - current_d)
-                           + 0.65 * max(0.0, 70.0 - future_d)) / 70.0
+            danger = sum(max(0, 70 - math.hypot(nx - e["pos"][0], ny - e["pos"][1])) / 70
+                         for e in enemies)
             score = 2.5 * (dx * desired[0] + dy * desired[1]) - 0.55 * danger
             score -= 0.25 * abs(offset)
             if score > best_score:
                 best_score, best_vec = score, (dx, dy)
         return best_vec
+
+    def survival_zone_goal(self, me, enemies, zone):
+        """Choose a conservative point within the next safe zone, not its center.
+
+        Keep a meaningful safety buffer. Only reposition when the current
+        location is too close to the next boundary or visible enemies.
+        """
+        x, y = me["pos"][:2]
+        cx, cy = zone["next_center"]
+        radius = zone["next_radius"]
+        # Small endgame zones need a smaller safety buffer.
+        buffer = min(24.0, max(5.0, radius * 0.18))
+        safe_radius = max(0.0, radius - buffer)
+        current_dist = math.hypot(x - cx, y - cy)
+        nearest = min((math.hypot(x-e["pos"][0], y-e["pos"][1])
+                       for e in enemies), default=1e6)
+        # Avoid unnecessary trips to the center when already safe.
+        if current_dist <= safe_radius and nearest > 65.0:
+            return (x, y)
+
+        # Candidate points spread through the safe area, including the center.
+        candidates = [(cx, cy)]
+        for fraction in (0.48, 0.82):
+            r = safe_radius * fraction
+            for i in range(12):
+                a = (2 * math.pi * i / 12)
+                candidates.append((cx + r * math.cos(a), cy + r * math.sin(a)))
+        best = (cx, cy)
+        best_score = -1e20
+        for px, py in candidates:
+            travel = math.hypot(px-x, py-y)
+            # Distance is costly: avoid traversing the map to escape a
+            # hypothetical threat; visible enemies are the only evidence.
+            score = -0.035 * travel
+            for enemy in enemies:
+                d = math.hypot(px-enemy["pos"][0], py-enemy["pos"][1])
+                score -= 2.0 * max(0.0, 80.0-d) / 80.0
+            # Keep a little extra space from the shrinking edge.
+            score -= 0.12 * (math.hypot(px-cx, py-cy) / max(radius, 1.0))
+            if score > best_score:
+                best_score, best = score, (px, py)
+        return best
 
     def movement_direction(self, me, goal, enemies, zone, tick):
         """Steer toward goal while avoiding nearby mechs and recovering from stalls."""
@@ -155,24 +186,15 @@ class Bot:
         threat_count = 0
         for enemy in enemies:
             ex, ey = enemy["pos"][:2]
-            evx, evy = enemy.get("vel", (0.0, 0.0))[:2]
-            evx = max(-20.0, min(20.0, evx))
-            evy = max(-20.0, min(20.0, evy))
-            # Avoid the enemy's predicted position as well as its current one.
-            future_x, future_y = ex + 1.2 * evx, ey + 1.2 * evy
-            current_dist = math.hypot(x - ex, y - ey)
-            future_dist = math.hypot(x - future_x, y - future_y)
-            distance = 0.4 * current_dist + 0.6 * future_dist
+            vx, vy = x - ex, y - ey
+            distance = math.hypot(vx, vy)
             if distance >= 85.0:
                 continue
             threat_count += 1
             strength = min(2.4, (85.0 - distance) / 45.0)
-            vx = x - (0.4 * ex + 0.6 * future_x)
-            vy = y - (0.4 * ey + 0.6 * future_y)
-            direction_length = math.hypot(vx, vy)
-            if direction_length > 0.001:
-                dx += strength * vx / direction_length
-                dy += strength * vy / direction_length
+            if distance > 0.001:
+                dx += strength * vx / distance
+                dy += strength * vy / distance
 
         # Don't retreat out of the playable zone. When outside, head inward.
         zx, zy = zone["center"][:2]
@@ -525,6 +547,9 @@ class Bot:
             if cube_goal is not None:
                 goal, goal_type = cube_goal
 
+        if goal_type == "zone":
+            goal = self.survival_zone_goal(me, enemies, obs["zone"])
+
         move_x, move_y, threat_count = self.movement_direction(
             me, goal, enemies, obs["zone"], obs["tick"]
         )
@@ -602,7 +627,7 @@ class Bot:
         )
 
         mf.draw.label(
-            f"V14 | HP {me['hp']:.0f} | "
+            f"V15 | HP {me['hp']:.0f} | "
             f"Cubes {me['cubes']} | {goal_type}"
         )
 
