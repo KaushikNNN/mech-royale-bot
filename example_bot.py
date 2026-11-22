@@ -1,15 +1,19 @@
 
-"""Mech Royale V11: V9 combat/loot + threat-aware navigation and stuck recovery."""
+"""Mech Royale V12: V11 plus map-aware short-horizon obstacle steering."""
 
 import math
+import json
+import os
 import mechfight as mf
 
 
 class Bot:
-    name = "survival-v11"
+    name = "map-steer-v12"
 
     def __init__(self, hello: mf.Hello):
         config = hello["config"]
+        self.obstacles = {}
+        self._load_map(hello)
         self.reach = config["loot"]["pickup_radius"]
         self.cube_reach = config["cubes"].get(
             "pickup_radius", 3.5
@@ -32,6 +36,97 @@ class Bot:
                 "cone_deg", 30.0
             )
         )
+
+    def _load_map(self, hello):
+        """Map data is optional: keep working if files are not mounted."""
+        root = hello.get("map", {}).get("dir", "/arena")
+        paths = [os.path.join(root, "v2", "world.json"),
+                 os.path.join(root, "world.json"),
+                 "arena/v2/world.json", "arena/world.json"]
+        for path in paths:
+            try:
+                with open(path, "r", encoding="utf-8") as f:
+                    world = json.load(f)
+                break
+            except (OSError, ValueError):
+                continue
+        else:
+            return
+        for prism in world.get("prisms", []):
+            ring = prism.get("ring", [])
+            if len(ring) < 6:
+                continue
+            # Bridges above the mech can be passed beneath; retain
+            # only solids whose vertical span overlaps ground travel.
+            base = prism.get("base", 0)
+            top = prism.get("top", 0)
+            if top - base < 1:
+                continue
+            coords = list(zip(ring[::2], ring[1::2]))
+            xs, ys = zip(*coords)
+            box = (min(xs), min(ys), max(xs), max(ys), coords, base, top)
+            ix0, ix1 = int(min(xs) // 40), int(max(xs) // 40)
+            iy0, iy1 = int(min(ys) // 40), int(max(ys) // 40)
+            for ix in range(ix0, ix1 + 1):
+                for iy in range(iy0, iy1 + 1):
+                    self.obstacles.setdefault((ix, iy), []).append(box)
+
+    @staticmethod
+    def _inside_poly(x, y, points):
+        inside = False
+        j = len(points) - 1
+        for i in range(len(points)):
+            xi, yi = points[i]
+            xj, yj = points[j]
+            if (yi > y) != (yj > y):
+                if x < (xj - xi) * (y - yi) / (yj - yi) + xi:
+                    inside = not inside
+            j = i
+        return inside
+
+    def _blocked(self, x, y, z):
+        # Mech radius is 2.5m; keep 3.5m clearance.
+        nearby = self.obstacles.get((int(x // 40), int(y // 40)), ())
+        for left, bottom, right, top, points, base, roof in nearby:
+            if z + 2 > roof or z + 8 < base:
+                continue
+            if x < left - 3.5 or x > right + 3.5 or y < bottom - 3.5 or y > top + 3.5:
+                continue
+            if self._inside_poly(x, y, points):
+                return True
+            for i, (ax, ay) in enumerate(points):
+                bx, by = points[(i + 1) % len(points)]
+                vx, vy = bx - ax, by - ay
+                denom = vx * vx + vy * vy
+                t = max(0.0, min(1.0, ((x - ax) * vx + (y - ay) * vy) / denom)) if denom else 0.0
+                if (x - ax - t * vx) ** 2 + (y - ay - t * vy) ** 2 < 3.5 ** 2:
+                    return True
+        return False
+
+    def _map_steer(self, me, desired, goal, enemies, zone):
+        if not self.obstacles:
+            return desired
+        x, y, z = me["pos"]
+        base = math.atan2(desired[1], desired[0])
+        # Evaluate several headings and short lookahead positions.
+        offsets = [0, -0.35, 0.35, -0.7, 0.7, -1.1, 1.1, -1.55, 1.55, 3.14]
+        best_score, best_vec = -1e12, desired
+        for offset in offsets:
+            a = base + offset
+            dx, dy = math.cos(a), math.sin(a)
+            if any(self._blocked(x + dx * step, y + dy * step, z)
+                   for step in (5, 10, 17)):
+                continue
+            nx, ny = x + dx * 17, y + dy * 17
+            if math.hypot(nx - zone["center"][0], ny - zone["center"][1]) > zone["radius"] - 5:
+                continue
+            danger = sum(max(0, 70 - math.hypot(nx - e["pos"][0], ny - e["pos"][1])) / 70
+                         for e in enemies)
+            score = 2.5 * (dx * desired[0] + dy * desired[1]) - 0.55 * danger
+            score -= 0.25 * abs(offset)
+            if score > best_score:
+                best_score, best_vec = score, (dx, dy)
+        return best_vec
 
     def movement_direction(self, me, goal, enemies, zone, tick):
         """Steer toward goal while avoiding nearby mechs and recovering from stalls."""
@@ -413,6 +508,9 @@ class Bot:
         move_x, move_y, threat_count = self.movement_direction(
             me, goal, enemies, obs["zone"], obs["tick"]
         )
+        move_x, move_y = self._map_steer(
+            me, (move_x, move_y), goal, enemies, obs["zone"]
+        )
         yaw = math.atan2(move_y, move_x)
 
         act.update(
@@ -484,7 +582,7 @@ class Bot:
         )
 
         mf.draw.label(
-            f"V11 | HP {me['hp']:.0f} | "
+            f"V12 | HP {me['hp']:.0f} | "
             f"Cubes {me['cubes']} | {goal_type}"
         )
 
