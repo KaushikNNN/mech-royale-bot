@@ -1,12 +1,12 @@
 
-"""Mech Royale V3: multi-threat avoidance and zone survival."""
+"""Mech Royale V4: original bot with targeted weapon acquisition."""
 
 import math
 import mechfight as mf
 
 
 class Bot:
-    name = "tactical-v3"
+    name = "loot-v4"
 
     def __init__(self, hello: mf.Hello):
         self.reach = hello["config"]["loot"]["pickup_radius"]
@@ -14,15 +14,16 @@ class Bot:
     def act(self, obs: mf.Observation) -> mf.Action:
         me = obs["self"]
         x, y, z = me["pos"]
+
         goal = obs["zone"]["next_center"]
 
         act: mf.Action = {"tick": obs["tick"]}
 
-        # Keep the starter's upgrade selection.
+        # Original upgrade selection.
         if obs["offer"]:
             act["pick"] = 0
 
-        # Pick up nearby weapons.
+        # Original pickup logic.
         near = [
             p for p in obs["pickups"]
             if math.dist(p["pos"][:2], (x, y)) < self.reach
@@ -35,79 +36,53 @@ class Bot:
         ):
             act["take"] = near[0]["id"]
 
-        # Identify visible enemies.
+        # Original enemy detection.
         enemies = sorted(
             (m for m in obs["mechs"] if m["kind"] == "mech"),
             key=lambda m: math.dist(m["pos"], me["pos"])
         )
 
-        # Zone direction.
-        gx = goal[0] - x
-        gy = goal[1] - y
-        gd = math.hypot(gx, gy)
+        # NEW: Look for nearby weapons when unequipped.
+        if me["weapons"][1] is None and me["in_zone"]:
+            available = [
+                p for p in obs["pickups"]
+                if p["kind"] != "gun"
+            ]
 
-        if gd > 0.001:
-            gx /= gd
-            gy /= gd
-        else:
-            gx = 0.0
-            gy = 0.0
+            if available:
+                closest = min(
+                    available,
+                    key=lambda p: math.dist(p["pos"][:2], (x, y))
+                )
 
-        # Multi-enemy avoidance.
-        avoid_x = 0.0
-        avoid_y = 0.0
+                loot_distance = math.dist(
+                    closest["pos"][:2],
+                    (x, y)
+                )
 
-        for enemy in enemies:
-            ex, ey = enemy["pos"][:2]
+                # Only take short detours when no enemy is close.
+                enemy_close = (
+                    enemies
+                    and math.dist(
+                        enemies[0]["pos"][:2],
+                        (x, y)
+                    ) < 60
+                )
 
-            dx = x - ex
-            dy = y - ey
-            dist = math.hypot(dx, dy)
+                if loot_distance < 35 and not enemy_close:
+                    goal = closest["pos"]
 
-            if 0.001 < dist < 90:
-                strength = (90 - dist) / 90
-                strength = strength * strength
-
-                avoid_x += (dx / dist) * strength
-                avoid_y += (dy / dist) * strength
-
-        # Limit avoidance strength.
-        avoid_length = math.hypot(avoid_x, avoid_y)
-
-        if avoid_length > 1:
-            avoid_x /= avoid_length
-            avoid_y /= avoid_length
-
-        # Zone safety takes priority when outside.
-        if me["in_zone"]:
-            zone_weight = 0.65
-            avoid_weight = 1.5
-        else:
-            zone_weight = 2.5
-            avoid_weight = 0.4
-
-        move_x = gx * zone_weight + avoid_x * avoid_weight
-        move_y = gy * zone_weight + avoid_y * avoid_weight
-
-        length = math.hypot(move_x, move_y)
-
-        if length > 0.001:
-            move_x /= length
-            move_y /= length
-        else:
-            move_x = gx
-            move_y = gy
-
+        # Original movement.
         yaw = math.atan2(goal[1] - y, goal[0] - x)
 
         act.update(
-            move=[move_x, move_y],
+            move=[math.cos(yaw), math.sin(yaw)],
             aim=[yaw, 0.0],
             boost=not me["in_zone"],
             jump=obs["tick"] % 40 == 0
         )
 
-        # Preserve original combat behavior.
+        # Original combat.
         if enemies:
             t = enemies[0]["pos"]
 
@@ -137,7 +112,7 @@ class Bot:
         )
 
         mf.draw.label(
-            f"V3 | hp {me['hp']:.0f} | "
+            f"V4 | hp {me['hp']:.0f} | "
             f"{len(enemies)} enemies"
         )
 
